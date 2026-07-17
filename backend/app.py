@@ -21,6 +21,7 @@ Non-coder notes:
 import os
 import json
 import re
+import secrets
 from datetime import datetime
 
 import pandas as pd
@@ -89,14 +90,24 @@ def _make_flow():
 @app.route("/login")
 def login():
     flow = _make_flow()
+    # Google now requires PKCE for this client type. We generate the
+    # code_verifier ourselves and stash it in the session so the SAME
+    # value can be reused in /oauth2callback (a new Flow object is created
+    # there and would otherwise have no idea what verifier was used here).
+    flow.code_verifier = secrets.token_urlsafe(64)
     auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
     session["state"] = state
+    session["code_verifier"] = flow.code_verifier
     return redirect(auth_url)
 
 
 @app.route("/oauth2callback")
 def oauth2callback():
     flow = _make_flow()
+    # Re-attach the code_verifier we generated in /login so it matches the
+    # code_challenge Google saw during the authorization step. Without this,
+    # token exchange fails with "invalid_grant: Missing code verifier".
+    flow.code_verifier = session.get("code_verifier")
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
     session["credentials"] = {
