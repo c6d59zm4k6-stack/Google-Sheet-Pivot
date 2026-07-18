@@ -178,6 +178,7 @@
     <div class="row">
       <button id="browse-btn" type="button">Choose file from Drive…</button>
       <span id="selected-file-label">No file selected</span>
+      <select id="tab-select" style="display:none;"></select>
     </div>
     <div class="row">
       <input type="text" id="request-input" placeholder="e.g. total revenue by region and month" />
@@ -201,12 +202,14 @@
   const loginGate = document.getElementById("login-gate");
   const browseBtn = document.getElementById("browse-btn");
   const selectedFileLabel = document.getElementById("selected-file-label");
+  const tabSelect = document.getElementById("tab-select");
   const requestInput = document.getElementById("request-input");
   const submitBtn = document.getElementById("submit-btn");
   const messageEl = document.getElementById("message");
   const resultArea = document.getElementById("result-area");
 
   let selectedFile = null; // { id, name, mimeType }
+  let selectedSheetTab = null; // tab name, only relevant for native Google Sheets
   let pickerLibLoaded = false;
   gapi.load("picker", () => { pickerLibLoaded = true; });
 
@@ -265,8 +268,41 @@
       const doc = data.docs[0];
       selectedFile = { id: doc.id, name: doc.name, mimeType: doc.mimeType };
       selectedFileLabel.textContent = doc.name;
+      selectedSheetTab = null;
+      tabSelect.style.display = "none";
+      tabSelect.innerHTML = "";
+
+      if (doc.mimeType === "application/vnd.google-apps.spreadsheet") {
+        loadSheetTabs(doc.id);
+      }
     }
   }
+
+  async function loadSheetTabs(fileId) {
+    try {
+      const res = await fetch(`${API_BASE}/sheet-tabs?file_id=${encodeURIComponent(fileId)}`, { credentials: "include" });
+      const data = await res.json();
+      if (data.error || !data.tabs || data.tabs.length <= 1) {
+        // Only one tab (or lookup failed) — nothing to choose, just use the default.
+        return;
+      }
+      tabSelect.innerHTML = "";
+      data.tabs.forEach(name => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        tabSelect.appendChild(opt);
+      });
+      selectedSheetTab = data.tabs[0];
+      tabSelect.style.display = "inline-block";
+    } catch (e) {
+      // Non-fatal: fall back to the default (first) tab.
+    }
+  }
+
+  tabSelect.addEventListener("change", () => {
+    selectedSheetTab = tabSelect.value;
+  });
 
   function renderPivot(pivotRows, columns) {
     if (!pivotRows.length) {
@@ -309,7 +345,12 @@
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_id: selectedFile.id, mime_type: selectedFile.mimeType, request: requestText }),
+        body: JSON.stringify({
+          file_id: selectedFile.id,
+          mime_type: selectedFile.mimeType,
+          sheet_tab: selectedSheetTab,
+          request: requestText,
+        }),
       });
       const data = await res.json();
 
