@@ -192,22 +192,65 @@ def picker_token():
 
 
 # ---------------------------------------------------------------------------
+# List the tabs in a Google Sheet, so the frontend can offer a tab picker
+# for spreadsheets that have more than one.
+# ---------------------------------------------------------------------------
+
+@app.route("/sheet-tabs")
+def sheet_tabs():
+    creds = _get_credentials()
+    if not creds:
+        return jsonify({"error": "not_logged_in"}), 401
+    file_id = request.args.get("file_id")
+    if not file_id:
+        return jsonify({"error": "no_file_id", "message": "Missing file_id."}), 400
+    try:
+        sheets = build("sheets", "v4", credentials=creds)
+        meta = sheets.spreadsheets().get(
+            spreadsheetId=file_id, fields="sheets.properties.title"
+        ).execute()
+        tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        return jsonify({"tabs": tabs})
+    except Exception as e:
+        return jsonify({"error": "sheets_error", "message": f"Could not read sheet tabs: {e}"}), 500
+
+
+# ---------------------------------------------------------------------------
 # Fetch a file's data into a pandas DataFrame
 # ---------------------------------------------------------------------------
 
-def _fetch_dataframe(creds, file_id, mime_type):
+def _fetch_dataframe(creds, file_id, mime_type, sheet_tab=None):
     if mime_type == "application/vnd.google-apps.spreadsheet":
         sheets = build("sheets", "v4", credentials=creds)
+        if sheet_tab:
+            # A1 notation requires the sheet name in single quotes (needed if
+            # it has spaces/special characters); a literal quote inside the
+            # name itself must be doubled, per Sheets' escaping rule.
+            safe_tab = sheet_tab.replace("'", "''")
+            range_ = f"'{safe_tab}'!A1:ZZ10000"
+        else:
+            # No tab specified: Sheets API defaults to the first tab.
+            range_ = "A1:ZZ10000"
         result = sheets.spreadsheets().values().get(
-            spreadsheetId=file_id, range="A1:ZZ10000"
+            spreadsheetId=file_id, range=range_
         ).execute()
         values = result.get("values", [])
         if not values:
             return pd.DataFrame(), sheets
         header, rows = values[0], values[1:]
-        # Pad short rows so pandas doesn't choke on ragged data
-        rows = [r + [""] * (len(header) - len(r)) for r in rows]
-        df = pd.DataFrame(rows, columns=header)
+        ncols = len(header)
+        # Google's Sheets API trims trailing empty cells per row independently,
+        # so rows can come back shorter than the header (pad with "") OR
+        # longer than the header (extra unlabeled columns with stray data —
+        # truncate them, since we have no header name to give them anyway).
+        fixed_rows = []
+        for r in rows:
+            if len(r) < ncols:
+                r = r + [""] * (ncols - len(r))
+            elif len(r) > ncols:
+                r = r[:ncols]
+            fixed_rows.append(r)
+        df = pd.DataFrame(fixed_rows, columns=header)
         return df, sheets
     else:
         # CSV or xlsx: download raw bytes via Drive API
@@ -291,6 +334,7 @@ def generate_pivot():
     body = request.get_json(force=True)
     file_id = body.get("file_id")
     mime_type = body.get("mime_type")
+    sheet_tab = body.get("sheet_tab")
     user_request = body.get("request", "").strip()
 
     if not file_id:
@@ -298,7 +342,7 @@ def generate_pivot():
     if not user_request:
         return jsonify({"error": "no_request", "message": "Please describe the pivot you want."}), 400
 
-    df, sheets_handle = _fetch_dataframe(creds, file_id, mime_type)
+    df, sheets_handle = _fetch_dataframe(creds, file_id, mime_type, sheet_tab)
     if df.empty:
         return jsonify({"error": "empty_file", "message": "That file has no data."}), 400
     df = _coerce_numeric(df)
