@@ -23,9 +23,10 @@ This is the fiddliest part. Go slowly, it's mostly clicking, no coding.
 2. Top left, click the project dropdown → **New Project**.
 3. Name it anything (e.g. "pivot-agent") → **Create**.
 
-### 2.2 Enable the two APIs you need
+### 2.2 Enable the APIs you need
 1. In the search bar at the top, search **Google Drive API** → click it → **Enable**.
 2. Search **Google Sheets API** → click it → **Enable**.
+3. Search **Google Picker API** → click it → **Enable**. (This powers the "Choose file from Drive" popup in the app — it's a different API from Drive itself.)
 
 ### 2.3 Configure the OAuth consent screen
 1. In the left sidebar: **APIs & Services → OAuth consent screen**.
@@ -47,10 +48,15 @@ This is the fiddliest part. Go slowly, it's mostly clicking, no coding.
    (You'll get your actual Render URL in Part 3 — come back and edit this afterward if needed. For now, you can also add `http://localhost:5000/oauth2callback` for local testing.)
 6. Click **Create**. A popup shows your **Client ID** and **Client Secret** — copy both somewhere safe.
 
-### 2.5 Share your Drive folder + get its ID
-1. Open the Google Drive folder containing your spreadsheets.
-2. Copy its ID from the URL: `https://drive.google.com/drive/folders/`**`THIS_PART_IS_THE_ID`**
-3. Keep this ID handy — it's `DRIVE_FOLDER_ID`.
+### 2.5 Create an API key for the Picker popup
+The in-app "Choose file from Drive" button opens Google's own file-browser popup (the Google Picker). It needs a plain API key — separate from the Client ID/Secret from step 2.4 — to authorize itself.
+1. Left sidebar: **APIs & Services → Credentials**.
+2. Click **+ Create Credentials → API key**. Copy the key that appears.
+3. Click the new key to edit it. Under **API restrictions**, choose **Restrict key** and select **Google Picker API** only.
+4. Under **Application restrictions**, choose **Websites** and add your Render URL (e.g. `https://YOUR-RENDER-APP-NAME.onrender.com/*`) once you have it from Part 3 — you can leave this blank for now and come back to lock it down afterward.
+5. Save. This value is your `GOOGLE_API_KEY`.
+
+You do **not** need to find or copy any Drive folder ID — the popup lets you browse your whole Drive and pick any file directly.
 
 ---
 
@@ -69,7 +75,7 @@ This is the fiddliest part. Go slowly, it's mostly clicking, no coding.
    - `GOOGLE_CLIENT_ID`
    - `GOOGLE_CLIENT_SECRET`
    - `OAUTH_REDIRECT_URI` → `https://YOUR-RENDER-APP-NAME.onrender.com/oauth2callback`
-   - `DRIVE_FOLDER_ID`
+   - `GOOGLE_API_KEY` → the Picker API key from step 2.5
    - `GROQ_API_KEY`
    - `FLASK_SECRET_KEY` → any random long string you make up
 7. Click **Create Web Service**. Wait for the build to finish (a few minutes).
@@ -83,7 +89,7 @@ This is the fiddliest part. Go slowly, it's mostly clicking, no coding.
 1. Visit your Render URL in a browser.
 2. Click **Sign in with Google** → log in with the same account you added as a test user in step 2.3.5.
 3. Google will show a warning screen ("Google hasn't verified this app") because it's in testing mode — click **Advanced → Go to (your app name)**. This is expected and safe; it's your own app.
-4. Pick a file from the dropdown, type your request (e.g. "total revenue by region and month"), click **Generate**.
+4. Click **Choose file from Drive…**, browse into any folder in your Drive, and pick a spreadsheet. Then type your request (e.g. "total revenue by region and month") and click **Generate**.
 5. The pivot appears above, and a link to the new tab in the Google Sheet appears below the table (only for native Google Sheets files, not CSV/xlsx).
 
 ---
@@ -93,4 +99,4 @@ This is the fiddliest part. Go slowly, it's mostly clicking, no coding.
 - **Free Render tier sleeps** after ~15 minutes of no traffic. The first request after sleeping takes ~30 seconds to wake up — this is normal, not a bug.
 - **Only Google Sheets get the "write to a new tab" feature.** CSV and Excel files uploaded to Drive will still generate a pivot in the browser, just without the Sheets write-back (there's no sheet to write a tab into).
 - **"In testing" OAuth mode** limits login to the test users you explicitly added. Fine for personal/small-team use. If you want anyone to log in without that restriction, Google requires an app verification review — not worth it unless you're making this public.
-- If something breaks, the most common causes are: redirect URI mismatch (must match *exactly*, including https vs http), or a missing/misspelled environment variable in Render.
+- If something breaks, the most common causes are: redirect URI mismatch (must match *exactly*, including https vs http), a missing/misspelled environment variable in Render, or (for the file-browser popup specifically) an API key that's restricted to a website URL that doesn't match where the app is actually running — double check step 2.5 if "Choose file from Drive" fails to open.
