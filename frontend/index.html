@@ -83,6 +83,8 @@
     position: sticky;
     top: 0;
   }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { background: #dce8e2; }
   tr:nth-child(even) td { background: #fbfbf9; }
 
   #sheet-link {
@@ -304,21 +306,65 @@
     selectedSheetTab = tabSelect.value;
   });
 
-  function renderPivot(pivotRows, columns) {
-    if (!pivotRows.length) {
+  // Client-side state for the currently displayed result, so clicking a
+  // column header can re-sort instantly without another server round-trip.
+  let lastPivotRows = [];
+  let lastPivotColumns = [];
+  let lastSheetTabUrl = null;
+  let clientSort = { col: null, dir: "asc" };
+
+  function renderPivot(pivotRows, columns, sheetTabUrl) {
+    lastPivotRows = pivotRows || [];
+    lastPivotColumns = columns || [];
+    lastSheetTabUrl = sheetTabUrl || null;
+    clientSort = { col: null, dir: "asc" };
+    renderTable();
+  }
+
+  function renderTable() {
+    if (!lastPivotRows.length) {
       resultArea.innerHTML = `<div class="placeholder">No results.</div>`;
       return;
     }
+
+    let rows = [...lastPivotRows];
+    if (clientSort.col) {
+      const { col, dir } = clientSort;
+      rows.sort((a, b) => {
+        const av = a[col], bv = b[col];
+        const an = parseFloat(av), bn = parseFloat(bv);
+        const bothNumeric = av !== "" && bv !== "" && !isNaN(an) && !isNaN(bn);
+        const cmp = bothNumeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+        return dir === "asc" ? cmp : -cmp;
+      });
+    }
+
     let html = "<table><thead><tr>";
-    columns.forEach(c => html += `<th>${c}</th>`);
+    lastPivotColumns.forEach(c => {
+      const arrow = clientSort.col === c ? (clientSort.dir === "asc" ? " ▲" : " ▼") : "";
+      html += `<th class="sortable" data-col="${c}" title="Click to sort">${c}${arrow}</th>`;
+    });
     html += "</tr></thead><tbody>";
-    pivotRows.forEach(row => {
+    rows.forEach(row => {
       html += "<tr>";
-      columns.forEach(c => html += `<td>${row[c] ?? ""}</td>`);
+      lastPivotColumns.forEach(c => html += `<td>${row[c] ?? ""}</td>`);
       html += "</tr>";
     });
     html += "</tbody></table>";
+    if (lastSheetTabUrl) {
+      html += `<a id="sheet-link" href="${lastSheetTabUrl}" target="_blank">Open this pivot in Google Sheets →</a>`;
+    }
     resultArea.innerHTML = html;
+
+    resultArea.querySelectorAll("th.sortable").forEach(th => {
+      th.addEventListener("click", () => {
+        const col = th.dataset.col;
+        clientSort = clientSort.col === col
+          ? { col, dir: clientSort.dir === "asc" ? "desc" : "asc" }
+          : { col, dir: "asc" };
+        renderTable();
+      });
+    });
   }
 
   browseBtn.addEventListener("click", openPicker);
@@ -360,10 +406,7 @@
         return;
       }
 
-      renderPivot(data.pivot, data.columns);
-      if (data.sheet_tab_url) {
-        resultArea.innerHTML += `<a id="sheet-link" href="${data.sheet_tab_url}" target="_blank">Open this pivot in Google Sheets →</a>`;
-      }
+      renderPivot(data.pivot, data.columns, data.sheet_tab_url);
       if (data.warning) {
         messageEl.textContent = data.warning;
       }
