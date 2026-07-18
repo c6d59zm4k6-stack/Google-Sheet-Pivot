@@ -281,22 +281,79 @@ def _coerce_numeric(df):
 
 
 # ---------------------------------------------------------------------------
+# Normalize an aggfunc name (which may be a synonym the model used) into
+# something pandas actually accepts, or a custom callable for the ones pandas
+# doesn't have a built-in string for (like "range").
+# ---------------------------------------------------------------------------
+
+_AGGFUNC_ALIASES = {
+    "sum": "sum", "total": "sum",
+    "mean": "mean", "average": "mean", "avg": "mean",
+    "median": "median",
+    "min": "min", "minimum": "min",
+    "max": "max", "maximum": "max",
+    "std": "std", "stddev": "std", "std_dev": "std", "standard_deviation": "std",
+    "var": "var", "variance": "var",
+    "count": "count", "counta": "count",  # pandas' 'count' already counts any non-blank value, text included
+    "nunique": "nunique", "unique_count": "nunique", "uniquecount": "nunique",
+    "distinct": "nunique", "distinct_count": "nunique", "count_unique": "nunique",
+    "prod": "prod", "product": "prod", "mult": "prod", "multiply": "prod",
+    "first": "first", "last": "last",
+    "any": "any", "all": "all",
+    "range": "range",  # handled specially below — not a built-in pandas string
+}
+
+
+def _resolve_aggfunc(name):
+    key = str(name or "sum").strip().lower().replace(" ", "_").replace("-", "_")
+    if key not in _AGGFUNC_ALIASES:
+        allowed = sorted(set(_AGGFUNC_ALIASES.values()))
+        raise ValueError(f"Unsupported aggregation '{name}'. Supported: {', '.join(allowed)}.")
+    resolved = _AGGFUNC_ALIASES[key]
+    if resolved == "range":
+        return lambda s: s.max() - s.min()
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Ask Groq to turn the plain-English request into a pivot spec
 # ---------------------------------------------------------------------------
 
 def _get_pivot_spec(user_request, columns):
     system_prompt = (
-        "You convert a user's plain-English request into a JSON pivot table spec. "
+        "You convert a user's plain-English data-analysis request into a JSON spec. "
         "You will be given the available column names and the user's request. "
         "Respond with ONLY a JSON object, no other text, no markdown fences. "
-        "The JSON must have this shape: "
-        '{"index": ["col_a"], "columns": [], "values": ["col_b"], "aggfunc": "sum"} '
-        "Rules: "
-        "- 'index' = columns to group rows by (at least one, from the request). "
-        "- 'columns' = columns to pivot into new columns (often empty list). "
-        "- 'values' = numeric column(s) to aggregate. "
-        "- 'aggfunc' = one of: sum, mean, count, min, max. "
-        "- Only use column names from the provided list, exactly as given."
+        "There are four possible \"operation\" types — pick exactly one:\n"
+        "\n"
+        "1) \"pivot\" — group rows and aggregate one column. Shape:\n"
+        '   {"operation": "pivot", "index": ["col_a"], "columns": [], "values": ["col_b"], "aggfunc": "sum"}\n'
+        "   'aggfunc' must be one of: sum, mean, median, min, max, std, var, count, "
+        "nunique, prod, first, last, any, all, range.\n"
+        "   Guidance — average -> mean; standard deviation -> std; variance -> var; "
+        "unique/distinct count -> nunique; plain row count (any column, incl. text) -> count; "
+        "product of values -> prod; max-minus-min -> range; any/all only make sense on "
+        "True/False columns.\n"
+        "\n"
+        "2) \"correlation\" — correlation between exactly two numeric columns, optionally per "
+        "group. Shape:\n"
+        '   {"operation": "correlation", "index": [], "values": ["col_a", "col_b"]}\n'
+        "   'index' is an empty list for one overall correlation, or one or more columns to "
+        "compute it separately within each group.\n"
+        "\n"
+        "3) \"ratio\" — divide one aggregated column by another, per group (e.g. \"average "
+        "revenue per student\" = sum(revenue) / sum(students)). Shape:\n"
+        '   {"operation": "ratio", "index": ["col_a"], "values": ["numerator_col", "denominator_col"], "aggfunc": "sum"}\n'
+        "   'aggfunc' is how each side is aggregated before dividing (usually sum, sometimes mean).\n"
+        "\n"
+        "4) \"diff\" — change from one period/step to the next, of an aggregated column (e.g. "
+        "\"month-over-month change in revenue\"). Shape:\n"
+        '   {"operation": "diff", "index": ["period_col"], "values": ["col_b"], "aggfunc": "sum"}\n'
+        "   Only use this when the request is clearly about change over a sequence (time, "
+        "rank, etc.) — 'index' should be the column defining that sequence.\n"
+        "\n"
+        "General rules: only use column names from the provided list, exactly as given. "
+        "Default to \"pivot\" unless the request clearly matches one of the other three."
     )
     user_msg = f"Available columns: {columns}\nUser request: {user_request}"
 
@@ -353,18 +410,84 @@ def generate_pivot():
         return jsonify({"error": "spec_failed", "message": f"Could not interpret the request: {e}"}), 500
 
     try:
-        pivot = pd.pivot_table(
-            df,
-            index=spec.get("index") or None,
-            columns=spec.get("columns") or None,
-            values=spec.get("values") or None,
-            aggfunc=spec.get("aggfunc", "sum"),
-        )
-        pivot = pivot.reset_index()
-        # Flatten multi-level columns if 'columns' was used
+        operation = spec.get("operation", "pivot")
+        idx = spec.get("index") or []
+        vals = spec.get("values") or []
+
+        if operation == "pivot":
+            pivot = pd.pivot_table(
+                df,
+                index=idx or None,
+                columns=spec.get("columns") or None,
+                values=vals or None,
+                aggfunc=_resolve_aggfunc(spec.get("aggfunc")),
+            )
+            pivot = pivot.reset_index()
+
+        elif operation == "correlation":
+            if len(vals) != 2:
+                raise ValueError("Correlation needs exactly two columns in 'values'.")
+            col_a, col_b = vals
+            label = f"corr_{col_a}_{col_b}"
+            if idx:
+                pivot = (
+                    df.groupby(idx)
+                    .apply(lambda g: g[col_a].corr(g[col_b]))
+                    .reset_index(name=label)
+                )
+            else:
+                pivot = pd.DataFrame({label: [df[col_a].corr(df[col_b])]})
+
+        elif operation == "ratio":
+            if len(vals) != 2:
+                raise ValueError("Ratio needs exactly two columns in 'values' (numerator, denominator).")
+            num_col, denom_col = vals
+            aggfunc = _resolve_aggfunc(spec.get("aggfunc"))
+            label = f"{num_col}_per_{denom_col}"
+            if idx:
+                grouped = df.groupby(idx).agg(
+                    _num=(num_col, aggfunc), _denom=(denom_col, aggfunc)
+                )
+                grouped[label] = grouped["_num"] / grouped["_denom"]
+                pivot = grouped[[label]].reset_index()
+            else:
+                num = df[num_col].agg(aggfunc)
+                denom = df[denom_col].agg(aggfunc)
+                pivot = pd.DataFrame({label: [num / denom]})
+
+        elif operation == "diff":
+            if not idx:
+                raise ValueError("Diff needs an 'index' column defining the sequence (e.g. a date/period column).")
+            if len(vals) != 1:
+                raise ValueError("Diff needs exactly one column in 'values'.")
+            aggfunc = _resolve_aggfunc(spec.get("aggfunc"))
+            grouped = df.groupby(idx)[vals[0]].agg(aggfunc)
+            # Sort by real chronological order if the labels parse as dates, but keep
+            # the ORIGINAL labels for display (parsing "Jan"/"Feb" defaults to a
+            # nonsense year internally — we only want it for sort order, not to show).
+            date_sort_used = False
+            try:
+                parsed = pd.to_datetime(grouped.index, errors="raise")
+                grouped = grouped.iloc[parsed.argsort()]
+                date_sort_used = True
+            except Exception:
+                grouped = grouped.sort_index()
+            diffed = grouped.diff()
+            pivot = diffed.reset_index()
+            pivot.columns = [idx[0], f"{vals[0]}_change"]
+            if not date_sort_used:
+                pivot.attrs["order_warning"] = (
+                    f"'{idx[0]}' wasn't recognized as a date, so rows are sorted "
+                    "alphabetically rather than chronologically — double check the order."
+                )
+
+        else:
+            raise ValueError(f"Unknown operation '{operation}'.")
+
+        # Flatten multi-level columns if 'columns' was used (pivot operation only)
         pivot.columns = [str(c) if not isinstance(c, tuple) else "_".join(map(str, c)) for c in pivot.columns]
     except Exception as e:
-        return jsonify({"error": "pivot_failed", "message": f"Could not build pivot: {e}", "spec": spec}), 500
+        return jsonify({"error": "pivot_failed", "message": f"Could not build result: {e}", "spec": spec}), 500
 
     # Write back to a new tab, only possible for native Google Sheets files
     sheet_tab_url = None
@@ -394,6 +517,7 @@ def generate_pivot():
         "columns": list(pivot.columns),
         "sheet_tab_url": sheet_tab_url,
         "spec_used": spec,
+        "warning": pivot.attrs.get("order_warning"),
     })
 
 
