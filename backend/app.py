@@ -347,6 +347,7 @@ _AGGFUNC_ALIASES = {
     "first": "first", "last": "last",
     "any": "any", "all": "all",
     "range": "range",  # handled specially below — not a built-in pandas string
+    "mode": "mode", "most_common": "mode", "most_frequent": "mode", "top_value": "mode",
 }
 
 
@@ -358,7 +359,16 @@ def _resolve_aggfunc(name):
     resolved = _AGGFUNC_ALIASES[key]
     if resolved == "range":
         return lambda s: s.max() - s.min()
+    if resolved == "mode":
+        return lambda s: s.mode().iloc[0] if not s.mode().empty else None
     return resolved
+
+
+def _canonical_aggfunc_label(name):
+    """The resolved canonical name only (e.g. 'nunique', 'range', 'mode'), for
+    building deterministic, self-describing output column names."""
+    key = str(name or "sum").strip().lower().replace(" ", "_").replace("-", "_")
+    return _AGGFUNC_ALIASES.get(key, "sum")
 
 
 # ---------------------------------------------------------------------------
@@ -375,28 +385,35 @@ def _get_pivot_spec(user_request, columns):
         "1) \"pivot\" — group rows and aggregate one column. Shape:\n"
         '   {"operation": "pivot", "index": ["col_a"], "columns": [], "values": ["col_b"], "aggfunc": "sum"}\n'
         "   'aggfunc' must be one of: sum, mean, median, min, max, std, var, count, "
-        "nunique, prod, first, last, any, all, range.\n"
+        "nunique, prod, first, last, any, all, range, mode.\n"
         "   Guidance — average -> mean; standard deviation -> std; variance -> var; "
         "unique/distinct count -> nunique; plain row count (any column, incl. text) -> count; "
-        "product of values -> prod; max-minus-min -> range; any/all only make sense on "
-        "True/False columns.\n"
+        "product of values -> prod; max-minus-min -> range; most common/most frequent value -> "
+        "mode; any/all only make sense on True/False columns.\n"
+        "   Output column naming: when 'values' has exactly one column and 'columns' is empty, "
+        "the result column is named \"<value_column>_<aggfunc>\" (e.g. values=[\"Revenue\"], "
+        "aggfunc=\"sum\" -> a column literally named \"Revenue_sum\"). Use that exact name if "
+        "you need to 'sort' or filter ('having') by it.\n"
         "\n"
         "2) \"correlation\" — correlation between exactly two numeric columns, optionally per "
         "group. Shape:\n"
         '   {"operation": "correlation", "index": [], "values": ["col_a", "col_b"]}\n'
         "   'index' is an empty list for one overall correlation, or one or more columns to "
         "compute it separately within each group.\n"
+        "   Output column naming: the result column is named \"corr_<col_a>_<col_b>\".\n"
         "\n"
         "3) \"ratio\" — divide one aggregated column by another, per group (e.g. \"average "
         "revenue per student\" = sum(revenue) / sum(students)). Shape:\n"
         '   {"operation": "ratio", "index": ["col_a"], "values": ["numerator_col", "denominator_col"], "aggfunc": "sum"}\n'
         "   'aggfunc' is how each side is aggregated before dividing (usually sum, sometimes mean).\n"
+        "   Output column naming: the result column is named \"<numerator_col>_per_<denominator_col>\".\n"
         "\n"
         "4) \"diff\" — change from one period/step to the next, of an aggregated column (e.g. "
         "\"month-over-month change in revenue\"). Shape:\n"
         '   {"operation": "diff", "index": ["period_col"], "values": ["col_b"], "aggfunc": "sum"}\n'
         "   Only use this when the request is clearly about change over a sequence (time, "
         "rank, etc.) — 'index' should be the column defining that sequence.\n"
+        "   Output column naming: the result column is named \"<col_b>_change\".\n"
         "\n"
         "General rules: only use column names from the provided list, exactly as given. "
         "Default to \"pivot\" unless the request clearly matches one of the other three.\n"
@@ -409,8 +426,9 @@ def _get_pivot_spec(user_request, columns):
         '- "having": same shape as filters, but applied to the RESULT after aggregation '
         "(e.g. \"only districts with more than 5 schools\").\n"
         '- "sort": {"by": "column_name", "order": "asc"} or {"by": "column_name", "order": "desc"}. '
-        "'by' must be a column that appears in the final result (an index/group column or "
-        "the aggregated value column).\n"
+        "'by' must be EXACTLY a column name that appears in the final result — either an "
+        "index/group column (its original name) or the aggregated value column (using the "
+        "output naming rule documented above for that operation type).\n"
         '- "limit": an integer cap on the number of result rows, applied after sorting '
         "(e.g. \"top 5 districts by revenue\" -> sort desc by revenue + limit 5)."
     )
@@ -495,6 +513,15 @@ def generate_pivot():
                 aggfunc=_resolve_aggfunc(spec.get("aggfunc")),
             )
             pivot = pivot.reset_index()
+            # Simple group+aggregate (no column-spread): rename the aggregated
+            # value column to "<value>_<aggfunc>" per the convention documented
+            # to the model. This both makes the header self-describing (it was
+            # previously just "School Name" even when showing a COUNT) and lets
+            # sort/having reliably reference this column by the name the model
+            # was told to expect.
+            if len(vals) == 1 and not spec.get("columns"):
+                agg_label = _canonical_aggfunc_label(spec.get("aggfunc"))
+                pivot = pivot.rename(columns={vals[0]: f"{vals[0]}_{agg_label}"})
 
         elif operation == "correlation":
             if len(vals) != 2:
@@ -564,11 +591,23 @@ def generate_pivot():
         pivot = _apply_filters(pivot, spec.get("having"))
 
         sort_spec = spec.get("sort")
-        if sort_spec and sort_spec.get("by") in pivot.columns:
-            pivot = pivot.sort_values(
-                by=sort_spec["by"],
-                ascending=(sort_spec.get("order", "asc").lower() != "desc"),
-            )
+        if sort_spec:
+            sort_by = sort_spec.get("by")
+            if sort_by in pivot.columns:
+                pivot = pivot.sort_values(
+                    by=sort_by,
+                    ascending=(sort_spec.get("order", "asc").lower() != "desc"),
+                )
+            else:
+                # Don't fail the whole request over a bad sort column, but don't
+                # silently ignore it either — the person asked for an order and
+                # didn't get one, so say so.
+                existing_warning = pivot.attrs.get("order_warning", "")
+                pivot.attrs["order_warning"] = (
+                    existing_warning
+                    + f" Requested sort column '{sort_by}' wasn't found in the result "
+                    f"(available: {', '.join(pivot.columns)}), so sorting was skipped."
+                ).strip()
 
         limit = spec.get("limit")
         if isinstance(limit, int) and limit > 0:
