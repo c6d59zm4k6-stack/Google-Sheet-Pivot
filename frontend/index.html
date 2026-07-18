@@ -123,6 +123,22 @@
     background: #9fb3ac;
     cursor: not-allowed;
   }
+  button#browse-btn {
+    padding: 10px 16px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: white;
+    color: var(--ink);
+    font-size: 14px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button#browse-btn:hover { background: var(--accent-soft); }
+  #selected-file-label {
+    font-size: 13px;
+    color: var(--muted);
+    align-self: center;
+  }
   #message {
     font-size: 13px;
     color: #a0442f;
@@ -146,6 +162,7 @@
 </style>
 </head>
 <body>
+<script src="https://apis.google.com/js/api.js"></script>
 
 <header>
   <h1>Pivot Table Agent</h1>
@@ -159,9 +176,10 @@
 
   <div id="controls" style="display:none;">
     <div class="row">
-      <select id="file-select">
-        <option value="">Select a file…</option>
-      </select>
+      <button id="browse-btn" type="button">Choose file from Drive…</button>
+      <span id="selected-file-label">No file selected</span>
+    </div>
+    <div class="row">
       <input type="text" id="request-input" placeholder="e.g. total revenue by region and month" />
       <button id="submit-btn">Generate</button>
     </div>
@@ -181,11 +199,16 @@
   const authArea = document.getElementById("auth-area");
   const controls = document.getElementById("controls");
   const loginGate = document.getElementById("login-gate");
-  const fileSelect = document.getElementById("file-select");
+  const browseBtn = document.getElementById("browse-btn");
+  const selectedFileLabel = document.getElementById("selected-file-label");
   const requestInput = document.getElementById("request-input");
   const submitBtn = document.getElementById("submit-btn");
   const messageEl = document.getElementById("message");
   const resultArea = document.getElementById("result-area");
+
+  let selectedFile = null; // { id, name, mimeType }
+  let pickerLibLoaded = false;
+  gapi.load("picker", () => { pickerLibLoaded = true; });
 
   async function checkStatus() {
     const res = await fetch(`${API_BASE}/status`, { credentials: "include" });
@@ -194,7 +217,6 @@
       loginGate.style.display = "none";
       controls.style.display = "flex";
       authArea.innerHTML = `<button onclick="location.href='/logout'">Sign out</button>`;
-      loadFiles();
     } else {
       loginGate.style.display = "block";
       controls.style.display = "none";
@@ -202,22 +224,48 @@
     }
   }
 
-  async function loadFiles() {
-    fileSelect.innerHTML = `<option value="">Loading files…</option>`;
-    const res = await fetch(`${API_BASE}/list-files`, { credentials: "include" });
+  async function openPicker() {
+    messageEl.textContent = "";
+    const res = await fetch(`${API_BASE}/picker-token`, { credentials: "include" });
     const data = await res.json();
     if (data.error) {
-      fileSelect.innerHTML = `<option value="">Could not load files</option>`;
+      messageEl.textContent = data.message || "Could not open Google Drive.";
       return;
     }
-    fileSelect.innerHTML = `<option value="">Select a file…</option>`;
-    data.files.forEach(f => {
-      const opt = document.createElement("option");
-      opt.value = f.id;
-      opt.dataset.mime = f.mimeType;
-      opt.textContent = f.name;
-      fileSelect.appendChild(opt);
-    });
+
+    const buildAndShow = () => {
+      // ViewId.DOCS shows all file types and lets the user navigate folders;
+      // setMimeTypes restricts which files are *selectable* (folders stay
+      // navigable regardless).
+      const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
+        .setIncludeFolders(true)
+        .setSelectFolderEnabled(false)
+        .setMimeTypes(
+          "application/vnd.google-apps.spreadsheet,text/csv," +
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+      const picker = new google.picker.PickerBuilder()
+        .addView(view)
+        .setOAuthToken(data.access_token)
+        .setDeveloperKey(data.api_key)
+        .setCallback(pickerCallback)
+        .build();
+      picker.setVisible(true);
+    };
+
+    if (pickerLibLoaded) {
+      buildAndShow();
+    } else {
+      gapi.load("picker", buildAndShow);
+    }
+  }
+
+  function pickerCallback(data) {
+    if (data.action === google.picker.Action.PICKED) {
+      const doc = data.docs[0];
+      selectedFile = { id: doc.id, name: doc.name, mimeType: doc.mimeType };
+      selectedFileLabel.textContent = doc.name;
+    }
   }
 
   function renderPivot(pivotRows, columns) {
@@ -237,14 +285,14 @@
     resultArea.innerHTML = html;
   }
 
+  browseBtn.addEventListener("click", openPicker);
+
   submitBtn.addEventListener("click", async () => {
     messageEl.textContent = "";
-    const fileId = fileSelect.value;
-    const mimeType = fileSelect.selectedOptions[0]?.dataset.mime;
     const requestText = requestInput.value.trim();
 
-    if (!fileId) {
-      messageEl.textContent = "Please select a file.";
+    if (!selectedFile) {
+      messageEl.textContent = "Please choose a file from Google Drive.";
       return;
     }
     if (!requestText) {
@@ -261,7 +309,7 @@
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_id: fileId, mime_type: mimeType, request: requestText }),
+        body: JSON.stringify({ file_id: selectedFile.id, mime_type: selectedFile.mimeType, request: requestText }),
       });
       const data = await res.json();
 
