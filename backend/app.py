@@ -281,6 +281,52 @@ def _coerce_numeric(df):
 
 
 # ---------------------------------------------------------------------------
+# Apply a list of {"column","op","value"} filters (combined with AND) to any
+# DataFrame. Used both BEFORE aggregation (raw-row filters, e.g. "only
+# Pithoragarh district") and AFTER aggregation (e.g. "only districts with
+# more than 5 schools" — a "having" filter on the pivot result itself).
+# ---------------------------------------------------------------------------
+
+def _apply_filters(df, filters):
+    if not filters:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for f in filters:
+        col = f.get("column")
+        op = f.get("op")
+        val = f.get("value")
+        if col not in df.columns:
+            raise ValueError(f"Filter column '{col}' not found.")
+        series = df[col]
+
+        if op in (">", ">=", "<", "<="):
+            series_num = pd.to_numeric(series, errors="coerce")
+            val_num = float(val)
+            if op == ">":
+                cond = series_num > val_num
+            elif op == ">=":
+                cond = series_num >= val_num
+            elif op == "<":
+                cond = series_num < val_num
+            else:
+                cond = series_num <= val_num
+        elif op == "==":
+            cond = series.astype(str).str.strip().str.lower() == str(val).strip().lower()
+        elif op == "!=":
+            cond = series.astype(str).str.strip().str.lower() != str(val).strip().lower()
+        elif op == "contains":
+            cond = series.astype(str).str.contains(str(val), case=False, na=False)
+        elif op == "in":
+            values = val if isinstance(val, list) else [val]
+            values_lower = [str(v).strip().lower() for v in values]
+            cond = series.astype(str).str.strip().str.lower().isin(values_lower)
+        else:
+            raise ValueError(f"Unsupported filter operator '{op}'.")
+        mask &= cond
+    return df[mask]
+
+
+# ---------------------------------------------------------------------------
 # Normalize an aggfunc name (which may be a synonym the model used) into
 # something pandas actually accepts, or a custom callable for the ones pandas
 # doesn't have a built-in string for (like "range").
@@ -353,9 +399,26 @@ def _get_pivot_spec(user_request, columns):
         "rank, etc.) — 'index' should be the column defining that sequence.\n"
         "\n"
         "General rules: only use column names from the provided list, exactly as given. "
-        "Default to \"pivot\" unless the request clearly matches one of the other three."
+        "Default to \"pivot\" unless the request clearly matches one of the other three.\n"
+        "\n"
+        "Optional fields, usable alongside ANY of the four operations above:\n"
+        '- "filters": row-level filters applied to the raw data BEFORE aggregation, e.g. '
+        "only include certain districts/dates/values. List of "
+        '{"column": "col_name", "op": "==", "value": "X"}, combined with AND. '
+        "'op' is one of: ==, !=, >, >=, <, <=, contains, in (value is a list for 'in').\n"
+        '- "having": same shape as filters, but applied to the RESULT after aggregation '
+        "(e.g. \"only districts with more than 5 schools\").\n"
+        '- "sort": {"by": "column_name", "order": "asc"} or {"by": "column_name", "order": "desc"}. '
+        "'by' must be a column that appears in the final result (an index/group column or "
+        "the aggregated value column).\n"
+        '- "limit": an integer cap on the number of result rows, applied after sorting '
+        "(e.g. \"top 5 districts by revenue\" -> sort desc by revenue + limit 5)."
     )
     user_msg = f"Available columns: {columns}\nUser request: {user_request}"
+
+    # Debug visibility: print exactly what we send to and receive from Groq,
+    # so it's inspectable in the Render logs when a result looks wrong.
+    print(f"\n=== GROQ REQUEST ===\n{user_msg}", flush=True)
 
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -372,9 +435,11 @@ def _get_pivot_spec(user_request, columns):
     )
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"].strip()
+    print(f"=== GROQ RAW RESPONSE ===\n{content}", flush=True)
     # Strip accidental markdown fences just in case
     content = re.sub(r"^```(json)?|```$", "", content, flags=re.MULTILINE).strip()
     spec = json.loads(content)
+    print(f"=== PARSED SPEC ===\n{spec}\n", flush=True)
     return spec
 
 
@@ -408,6 +473,13 @@ def generate_pivot():
         spec = _get_pivot_spec(user_request, list(df.columns))
     except Exception as e:
         return jsonify({"error": "spec_failed", "message": f"Could not interpret the request: {e}"}), 500
+
+    try:
+        df = _apply_filters(df, spec.get("filters"))
+        if df.empty:
+            return jsonify({"error": "empty_after_filter", "message": "No rows match those filters.", "spec": spec}), 400
+    except Exception as e:
+        return jsonify({"error": "filter_failed", "message": f"Could not apply filters: {e}", "spec": spec}), 500
 
     try:
         operation = spec.get("operation", "pivot")
@@ -486,6 +558,23 @@ def generate_pivot():
 
         # Flatten multi-level columns if 'columns' was used (pivot operation only)
         pivot.columns = [str(c) if not isinstance(c, tuple) else "_".join(map(str, c)) for c in pivot.columns]
+
+        # Post-aggregation filter ("having"), sort, and limit — apply in that
+        # order so "top N" requests (sort + limit) work as expected.
+        pivot = _apply_filters(pivot, spec.get("having"))
+
+        sort_spec = spec.get("sort")
+        if sort_spec and sort_spec.get("by") in pivot.columns:
+            pivot = pivot.sort_values(
+                by=sort_spec["by"],
+                ascending=(sort_spec.get("order", "asc").lower() != "desc"),
+            )
+
+        limit = spec.get("limit")
+        if isinstance(limit, int) and limit > 0:
+            pivot = pivot.head(limit)
+
+        pivot = pivot.reset_index(drop=True)
     except Exception as e:
         return jsonify({"error": "pivot_failed", "message": f"Could not build result: {e}", "spec": spec}), 500
 
