@@ -3,7 +3,8 @@ Pivot Table Agent - Backend
 ============================
 A small Flask app that:
   1. Lets the user log in with Google (OAuth)
-  2. Lists spreadsheet files in a specific Google Drive folder
+  2. Lets the user browse their Drive and pick a file via the Google
+     Picker popup (a native Google file-browser widget, not built by us)
   3. Reads the chosen file's data
   4. Sends the user's plain-English request + column headers to Groq
      to get back a "pivot spec" (rows/columns/values/aggregation)
@@ -14,11 +15,19 @@ A small Flask app that:
 Non-coder notes:
   - You do not need to understand every line here.
   - You DO need to fill in the values described in SETUP.md
-    (Google OAuth credentials, folder ID, Groq API key) as
-    environment variables before this will run.
+    (Google OAuth credentials, a Google API key for the Picker, Groq
+    API key) as environment variables before this will run.
 """
 
 import os
+
+# Google sometimes returns a granted scope list that differs slightly from
+# what was requested (e.g. if the user unchecks a permission box on the
+# consent screen, or Google reorders/normalizes the scope string). By default
+# oauthlib treats ANY scope mismatch as a hard error and raises instead of
+# just warning. This must be set before oauthlib's client code runs.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 import json
 import re
 import secrets
@@ -31,6 +40,7 @@ from flask_cors import CORS
 
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 
 # ---------------------------------------------------------------------------
@@ -43,8 +53,12 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 # Console "Authorized redirect URI" EXACTLY (see SETUP.md).
 OAUTH_REDIRECT_URI = os.environ["OAUTH_REDIRECT_URI"]
 
-# The Google Drive folder to look inside for files.
-DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
+# A plain Google API key (NOT the OAuth client secret) used only to
+# authorize the Google Picker widget in the browser. Create one at
+# https://console.cloud.google.com/apis/credentials -> Create Credentials ->
+# API key, and restrict it to the Google Picker API (and, for safety, to
+# your Render domain under "Application restrictions -> HTTP referrers").
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 # Groq API key (https://console.groq.com/keys)
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -117,6 +131,7 @@ def oauth2callback():
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
     }
     # Redirect back to the frontend page after login.
     return redirect("/")
@@ -136,29 +151,44 @@ def status():
 def _get_credentials():
     if "credentials" not in session:
         return None
-    return Credentials(**session["credentials"])
+
+    data = dict(session["credentials"])
+    expiry_str = data.pop("expiry", None)
+    creds = Credentials(**data)
+    if expiry_str:
+        creds.expiry = datetime.fromisoformat(expiry_str)
+
+    # Access tokens expire after about an hour. Refresh proactively so any
+    # caller (our own API calls, or the token we hand to the Picker) always
+    # gets a working one, rather than failing with a stale-token error.
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleAuthRequest())
+            session["credentials"]["token"] = creds.token
+            session["credentials"]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+        except Exception:
+            pass  # fall through with whatever token we already had
+
+    return creds
 
 
 # ---------------------------------------------------------------------------
-# List files in the configured Drive folder
+# Hand the frontend what it needs to open the Google Picker (file/folder
+# browser popup). The Picker itself talks directly to Google from the
+# browser — our backend just needs to supply a valid access token + API key.
 # ---------------------------------------------------------------------------
 
-@app.route("/list-files")
-def list_files():
+@app.route("/picker-token")
+def picker_token():
     creds = _get_credentials()
     if not creds:
         return jsonify({"error": "not_logged_in"}), 401
-
-    drive = build("drive", "v3", credentials=creds)
-    query = (
-        f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and "
-        "(mimeType = 'application/vnd.google-apps.spreadsheet' or "
-        "mimeType = 'text/csv' or "
-        "mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')"
-    )
-    results = drive.files().list(q=query, fields="files(id, name, mimeType)").execute()
-    files = results.get("files", [])
-    return jsonify({"files": files})
+    if not GOOGLE_API_KEY:
+        return jsonify({
+            "error": "no_api_key",
+            "message": "GOOGLE_API_KEY is not set on the server (see SETUP.md).",
+        }), 500
+    return jsonify({"access_token": creds.token, "api_key": GOOGLE_API_KEY})
 
 
 # ---------------------------------------------------------------------------
